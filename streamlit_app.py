@@ -573,29 +573,31 @@ with tab1:
 
     with right:
         delivered = df[df["status"] == "입고 완료"].copy()
-        delivered["month"] = delivered["actual_delivery_date"].dt.to_period("M").dt.to_timestamp()
-        trend = delivered.groupby("month").apply(
-            lambda g: pd.Series({
-                "CRD 대비": (g["actual_delivery_date"] <= g["CRD"]).mean(),
-                "CDD 대비": (g["actual_delivery_date"] <= g["CDD"]).mean(),
-                "입고 라인 수": len(g),
-            }),
-            include_groups=False,
-        ).reset_index()
-        series = ["CRD 대비", "CDD 대비"] if mode["internal"] else ["CRD 대비"]
-        trend_long = trend.melt(id_vars=["month", "입고 라인 수"], value_vars=series, var_name="기준", value_name="OTD")
-        fig = px.line(
-            trend_long, x="month", y="OTD", color="기준", markers=True,
-            title="월별 OTD% 추이" if mode["internal"] else "월별 요청 납기 준수율",
-            color_discrete_map={"CRD 대비": BLUE, "CDD 대비": ORANGE}, hover_data={"입고 라인 수": True},
-            labels={"month": "입고 월", "OTD": "OTD%"},
-        )
-        fig.update_traces(line_width=2, marker_size=8)
-        fig.update_yaxes(tickformat=".0%", range=[0, 1.05])
-        fig.update_xaxes(dtick="M1", tickformat="%Y-%m")
-        if not mode["internal"]:
-            fig.update_layout(showlegend=False)
-        st.plotly_chart(style(fig), width="stretch")
+        if delivered.empty:
+            # 아직 입고 완료된 라인이 없는 프로젝트(예: 세종 물류센터)는 추이를 그릴 수 없음
+            st.markdown("**월별 OTD% 추이**" if mode["internal"] else "**월별 요청 납기 준수율**")
+            st.info("선택한 조건에 입고 완료된 라인이 아직 없습니다.")
+        else:
+            delivered["month"] = delivered["actual_delivery_date"].dt.to_period("M").dt.to_timestamp()
+            delivered["CRD 대비"] = delivered["actual_delivery_date"] <= delivered["CRD"]
+            delivered["CDD 대비"] = delivered["actual_delivery_date"] <= delivered["CDD"]
+            trend = delivered.groupby("month", as_index=False).agg(
+                **{"CRD 대비": ("CRD 대비", "mean"), "CDD 대비": ("CDD 대비", "mean"), "입고 라인 수": ("line_key", "count")}
+            )
+            series = ["CRD 대비", "CDD 대비"] if mode["internal"] else ["CRD 대비"]
+            trend_long = trend.melt(id_vars=["month", "입고 라인 수"], value_vars=series, var_name="기준", value_name="OTD")
+            fig = px.line(
+                trend_long, x="month", y="OTD", color="기준", markers=True,
+                title="월별 OTD% 추이" if mode["internal"] else "월별 요청 납기 준수율",
+                color_discrete_map={"CRD 대비": BLUE, "CDD 대비": ORANGE}, hover_data={"입고 라인 수": True},
+                labels={"month": "입고 월", "OTD": "OTD%"},
+            )
+            fig.update_traces(line_width=2, marker_size=8)
+            fig.update_yaxes(tickformat=".0%", range=[0, 1.05])
+            fig.update_xaxes(dtick="M1", tickformat="%Y-%m")
+            if not mode["internal"]:
+                fig.update_layout(showlegend=False)
+            st.plotly_chart(style(fig), width="stretch")
 
     delayed_df = df[df["is_delayed"] & (df["delay_reason"].fillna("") != "")]
     if mode["internal"]:
@@ -739,6 +741,29 @@ with tab2:
             add_today_line(fig)
             st.plotly_chart(style(fig, height=480), width="stretch")
             st.caption("AIR 운임 등 추가 비용은 포함되지 않았습니다. 전환 전 공급망팀과 비용·가용 여부를 확인하세요.")
+
+            # AIR 로 바꿀 라인 엑셀 다운로드
+            air_lines = cand.loc[picked].copy()
+            air_lines["saving_days"] = (air_lines["revised_ETA"] - air_lines["air_eta"]).dt.days
+            air_table = table(air_lines.sort_values("saving_days", ascending=False), {
+                "order_no": "오더 번호", "line_no": "라인", "project_name": "프로젝트", "sub_project_name": "서브 프로젝트",
+                "product_family": "제품군", "product_code": "제품 코드", "source_plant": "공장", "quantity": "수량",
+                "status": "상태", "revised_ship_date": "출하 예정일", "CRD": "CRD", "revised_ETA": "현재 ETA (SEA)",
+                "air_eta": "AIR 전환 시 ETA", "saving_days": "단축일", "delay_days_vs_CRD": "현재 CRD 대비 지연일",
+            })
+            sim_summary = pd.DataFrame({
+                "항목": ["프로젝트", "서브 프로젝트", "목표", "AIR 전환 라인 수", "고객 계획 설치 완료",
+                       "현재 예상 설치 완료", "AIR 전환 시 설치 완료", "현재 예상 대비 단축일", "전환 후 병목 라인"],
+                "값": [project, sub, goal, len(picked), f"{plan_end:%Y-%m-%d}", f"{forecast_end:%Y-%m-%d}",
+                      f"{sim_end:%Y-%m-%d}", (forecast_end - sim_end).days,
+                      f"{new_gating['line_key']} {new_gating['product_family']}"],
+            })
+            st.download_button(
+                "📥 AIR 전환 라인 엑셀 다운로드",
+                data=to_excel({"AIR 전환 라인": air_table, "시뮬레이션 요약": sim_summary}),
+                file_name=f"AIR전환_{project}_{sub}_{TODAY:%Y%m%d}.xlsx".replace(" ", ""),
+                mime=XLSX_MIME, disabled=not picked, key="air_download",
+            )
 
 # ---------------------------------------------------------------- ③ Exception & Action / 납기 변경 안내
 with tab3:
