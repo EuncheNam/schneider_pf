@@ -2,9 +2,10 @@
 판넬 빌더 오더 납기 컨트롤 타워 (Streamlit 시작 코드)
 
 실행: streamlit run app.py
-데이터: data/orders.csv, data/eta_history.csv, data/project_milestones.csv (generate_data.py 로 생성)
+데이터: data/orders.csv, data/eta_history.csv (generate_data.py 로 생성, 사이드바에서 새 오더 파일로 업데이트)
 """
 
+import re
 from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
@@ -16,7 +17,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 DATA_DIR = Path(__file__).parent / "data"
-TODAY = pd.Timestamp("2026-10-23")  # generate_data.py 의 기준일과 동일
+AS_OF_FILE = DATA_DIR / "as_of.txt"
+
+
+def read_as_of() -> pd.Timestamp:
+    """기준일: 마지막으로 반영한 오더 파일의 날짜 (파일이 없으면 가상 데이터 기준일)"""
+    try:
+        return pd.Timestamp(AS_OF_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return pd.Timestamp("2026-10-23")  # generate_data.py 의 기준일과 동일
+
+
+TODAY = read_as_of()
 OPEN_STATUSES = ["발주 완료", "생산 중", "운송 중"]
 RISK_WINDOW_DAYS = 30
 AIR_DAYS = 10
@@ -33,15 +45,26 @@ st.set_page_config(page_title="PB 오더 납기 컨트롤 타워", page_icon="�
 # ---------------------------------------------------------------------------
 # 데이터 로딩
 # ---------------------------------------------------------------------------
+ORDER_DATE_COLUMNS = [
+    "order_date", "CRD", "CDD", "planned_ship_date", "revised_ship_date",
+    "original_ETA", "revised_ETA", "actual_delivery_date",
+]
+
+
 @st.cache_data
-def load_data():
-    order_dates = [
-        "order_date", "CRD", "CDD", "planned_ship_date", "revised_ship_date",
-        "original_ETA", "revised_ETA", "actual_delivery_date",
-    ]
-    orders = pd.read_csv(DATA_DIR / "orders.csv", parse_dates=order_dates)
-    history = pd.read_csv(DATA_DIR / "eta_history.csv", parse_dates=["snapshot_date", "old_ETA", "new_ETA"])
-    milestones = pd.read_csv(DATA_DIR / "project_milestones.csv", parse_dates=["start", "end"])
+def load_data(as_of: pd.Timestamp):
+    # as_of 는 캐시 구분용: 새 파일을 반영해 기준일이 바뀌면 다시 읽음
+    orders = pd.read_csv(DATA_DIR / "orders.csv", parse_dates=ORDER_DATE_COLUMNS, encoding="utf-8-sig", dtype={"order_no": str})
+    history = pd.read_csv(DATA_DIR / "eta_history.csv", parse_dates=["snapshot_date", "old_ETA", "new_ETA"],
+                          encoding="utf-8-sig", dtype={"order_no": str})
+
+    # 지연 여부는 업로드 파일에 없어도 되도록 날짜로 다시 계산
+    cancelled = orders["status"] == "취소"
+    final_eta = orders["actual_delivery_date"].fillna(orders["revised_ETA"])
+    orders["delay_days_vs_CRD"] = (final_eta - orders["CRD"]).dt.days.clip(lower=0).where(~cancelled, 0).astype(int)
+    orders["is_delayed"] = ~cancelled & (orders["delay_days_vs_CRD"] > 0)
+    orders["amount"] = orders["quantity"] * orders["unit_price"]
+    orders["expedited"] = orders["original_shipping_mode"].eq("SEA") & orders["shipping_mode"].eq("AIR")
 
     orders["line_key"] = orders["order_no"] + "-" + orders["line_no"].astype(str)
     orders["open_qty"] = orders["quantity"] - orders["shipped_qty"]
@@ -57,7 +80,7 @@ def load_data():
     change_count = history.groupby(["order_no", "line_no"]).size().rename("eta_change_count")
     orders = orders.merge(change_count, on=["order_no", "line_no"], how="left")
     orders["eta_change_count"] = orders["eta_change_count"].fillna(0).astype(int)
-    return orders, history, milestones
+    return orders, history, build_milestones(orders)
 
 
 def won_eok(value: float) -> str:
@@ -228,6 +251,8 @@ CUSTOMER_REASON = {
     "고객 사양 변경": "사양 변경 반영",
     "최초 확정일이 CRD 이후": "최초 회신 납기가 요청일 이후",
     "AIR 전환 (긴급 운송)": "항공 운송 전환으로 납기 단축",
+    "공장 일정 앞당김": "제조 일정 단축",
+    "사유 미기재": "일정 변경",
 }
 
 # 화면 표·엑셀 공통 컬럼 (원본 컬럼 → 표시 이름)
@@ -417,6 +442,24 @@ def phase_schedule(order_start, order_end, material_end, fab_days: int, plan_typ
     })
 
 
+def build_milestones(orders: pd.DataFrame) -> pd.DataFrame:
+    """서브 프로젝트별 단계 일정 (고객 계획: 모든 자재가 CRD 에 입고 / 현재 예상: 실제 입고일·현재 ETA 기준)"""
+    active = orders[orders["status"] != "취소"].copy()
+    active["material_date"] = active["actual_delivery_date"].fillna(active["revised_ETA"])
+    frames = []
+    for (project, sub_project), g in active.groupby(["project_name", "sub_project_name"]):
+        fab_days = 45 if "BlokSeT" in sub_project else 30
+        order_start, order_end = g["order_date"].min(), g["order_date"].max()
+        gating = g.loc[g["material_date"].idxmax()]
+        for plan_type, material_end in [("고객 계획", g["CRD"].max()), ("현재 예상", g["material_date"].max())]:
+            ms = phase_schedule(order_start, order_end, material_end, fab_days, plan_type)
+            ms["gating_line"] = ""
+            if plan_type == "현재 예상":
+                ms.loc[ms["phase"].str.startswith("2."), "gating_line"] = f"{gating['line_key']} {gating['product_family']}"
+            frames.append(ms.assign(project_name=project, sub_project_name=sub_project))
+    return pd.concat(frames, ignore_index=True)
+
+
 def air_candidates(lines: pd.DataFrame) -> pd.DataFrame:
     """아직 출하 전인 SEA 라인만 AIR 로 바꿀 수 있음"""
     cand = lines[lines["is_open"] & (lines["shipping_mode"] == "SEA") & (lines["revised_ship_date"] > TODAY)].copy()
@@ -434,6 +477,93 @@ def minimal_air_set(lines: pd.DataFrame, cand: pd.DataFrame, target=None) -> lis
             return chosen
         chosen.append(top)
         eta[top] = cand.at[top, "air_eta"]
+
+
+# ---------------------------------------------------------------------------
+# 오더 파일 업데이트 (새 파일을 어제 파일과 비교해 ETA 변경 이력을 쌓음)
+# ---------------------------------------------------------------------------
+REQUIRED_COLUMNS = [
+    "order_no", "line_no", "order_date", "customer_code", "project_name", "sub_project_name", "product_family",
+    "product_code", "source_plant", "quantity", "shipped_qty", "unit_price", "original_shipping_mode", "shipping_mode",
+    "CRD", "CDD", "planned_ship_date", "revised_ship_date", "original_ETA", "revised_ETA", "actual_delivery_date",
+    "status", "delay_reason",
+]
+KEYS = ["order_no", "line_no"]
+
+
+def read_orders_csv(source) -> pd.DataFrame:
+    return pd.read_csv(source, parse_dates=ORDER_DATE_COLUMNS, encoding="utf-8-sig", dtype={"order_no": str})
+
+
+def validate_orders(new: pd.DataFrame) -> list[str]:
+    errors = []
+    missing = [c for c in REQUIRED_COLUMNS if c not in new.columns]
+    if missing:
+        errors.append(f"필요한 컬럼이 없습니다: {', '.join(missing)}")
+    elif new.duplicated(KEYS).any():
+        dup = new.loc[new.duplicated(KEYS), KEYS].head(3).astype(str).agg("-".join, axis=1).tolist()
+        errors.append(f"같은 오더 번호 + 라인이 두 번 이상 있습니다: {', '.join(dup)}")
+    elif new["revised_ETA"].isna().any():
+        errors.append("revised_ETA(현재 납기)가 비어 있는 행이 있습니다.")
+    return errors
+
+
+def apply_update(new: pd.DataFrame, as_of: pd.Timestamp) -> dict:
+    """새 오더 파일을 반영: ① 어제 파일과 비교해 ETA 가 바뀐 라인을 이력에 추가 ② 어제 파일 보관 ③ 새 파일·기준일 저장"""
+    old = read_orders_csv(DATA_DIR / "orders.csv")
+    history = pd.read_csv(DATA_DIR / "eta_history.csv", parse_dates=["snapshot_date", "old_ETA", "new_ETA"], dtype={"order_no": str})
+
+    merged = new.merge(
+        old[KEYS + ["revised_ETA", "shipping_mode"]].rename(columns={"revised_ETA": "old_ETA", "shipping_mode": "old_mode"}),
+        on=KEYS, how="left",
+    )
+    changed = merged[merged["old_ETA"].notna() & (merged["revised_ETA"] != merged["old_ETA"])].copy()
+
+    last_seq = history.groupby(KEYS)["change_seq"].max().rename("last_seq")
+    changed = changed.merge(last_seq, on=KEYS, how="left")
+    air_switch = changed["old_mode"].eq("SEA") & changed["shipping_mode"].eq("AIR")
+    pulled_in = changed["revised_ETA"] < changed["old_ETA"]
+    reason = changed["delay_reason"].fillna("").replace("", "사유 미기재")
+    reason = reason.where(~pulled_in, "공장 일정 앞당김").where(~air_switch, "AIR 전환 (긴급 운송)")
+    new_rows = pd.DataFrame({
+        "snapshot_date": as_of,
+        "order_no": changed["order_no"],
+        "line_no": changed["line_no"],
+        "change_seq": changed["last_seq"].fillna(0).astype(int) + 1,
+        "old_ETA": changed["old_ETA"],
+        "new_ETA": changed["revised_ETA"],
+        "shift_days": (changed["revised_ETA"] - changed["old_ETA"]).dt.days,
+        "reason": reason,
+        "shipping_mode": changed["shipping_mode"],
+    })
+
+    archive = DATA_DIR / "archive"
+    archive.mkdir(exist_ok=True)
+    old.to_csv(archive / f"orders_{TODAY:%Y%m%d}.csv", index=False, encoding="utf-8-sig")
+    new[[c for c in new.columns if c not in ("delay_days_vs_CRD", "is_delayed")]].to_csv(
+        DATA_DIR / "orders.csv", index=False, encoding="utf-8-sig"
+    )
+    pd.concat([history, new_rows], ignore_index=True).to_csv(DATA_DIR / "eta_history.csv", index=False, encoding="utf-8-sig")
+    AS_OF_FILE.write_text(f"{as_of:%Y-%m-%d}")
+
+    old_keys = set(map(tuple, old[KEYS].values))
+    new_keys = set(map(tuple, new[KEYS].values))
+    return {
+        "as_of": as_of,
+        "changed": len(new_rows),
+        "later": int((new_rows["shift_days"] > 0).sum()),
+        "earlier": int((new_rows["shift_days"] < 0).sum()),
+        "added": len(new_keys - old_keys),
+        "removed": len(old_keys - new_keys),
+    }
+
+
+def date_from_filename(name: str):
+    match = re.search(r"(20\d{6})", name)
+    try:
+        return pd.Timestamp(match.group(1)) if match else None
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +603,7 @@ def hbar(frame, x, y, title, text=None, color=None, color_map=None, order=None, 
 # ---------------------------------------------------------------------------
 # 화면
 # ---------------------------------------------------------------------------
-orders, history, milestones = load_data()
+orders, history, milestones = load_data(TODAY)
 
 with st.sidebar:
     st.header("보기 모드")
@@ -489,6 +619,43 @@ with st.sidebar:
         families = st.multiselect("제품군", sorted(orders["product_family"].unique()))
         plants = st.multiselect("공장", sorted(orders["source_plant"].unique()))
         st.form_submit_button("Apply", type="primary", icon=":material/filter_alt:", width="stretch")
+
+    # 오더 파일 업데이트는 내부용 화면에서만
+    if mode_name == "전체 (내부용)":
+        st.header("데이터 업데이트")
+        if "update_result" in st.session_state:
+            r = st.session_state.pop("update_result")
+            st.success(
+                f"{r['as_of']:%Y-%m-%d} 기준으로 반영했습니다. ETA 변경 {r['changed']}건 "
+                f"(늦춰짐 {r['later']} · 앞당김 {r['earlier']}), 신규 라인 {r['added']}개, 빠진 라인 {r['removed']}개"
+            )
+        st.caption(f"현재 데이터 기준일: {TODAY:%Y-%m-%d}")
+        # 반영 후에는 업로드 칸을 비우기 위해 key 를 바꿈
+        uploaded = st.file_uploader("오더 파일 업로드 (CSV)", type="csv", key=f"orders_upload_{st.session_state.get('upload_count', 0)}",
+                                    help="orders.csv 와 같은 컬럼의 CSV. 파일 이름에 날짜(예: orders_20261024.csv)를 넣으면 기준일이 자동으로 채워집니다.")
+        if uploaded is not None:
+            default_date = date_from_filename(uploaded.name) or TODAY + pd.Timedelta(days=1)
+            as_of = pd.Timestamp(st.date_input("이 파일의 기준일", default_date.date(), key="upload_as_of"))
+            try:
+                new_orders = read_orders_csv(uploaded)
+                errors = validate_orders(new_orders)
+            except Exception as e:  # 형식이 다른 파일
+                new_orders, errors = None, [f"CSV 를 읽을 수 없습니다: {e}"]
+            if as_of < TODAY:
+                errors.append(f"기준일이 현재 데이터({TODAY:%Y-%m-%d})보다 이전입니다.")
+            for err in errors:
+                st.error(err)
+            if st.button("반영하기", type="primary", icon=":material/upload:", width="stretch", disabled=bool(errors)):
+                st.session_state["update_result"] = apply_update(new_orders, as_of)
+                st.session_state["upload_count"] = st.session_state.get("upload_count", 0) + 1
+                st.cache_data.clear()
+                st.rerun()
+
+        with st.expander("데이터 백업"):
+            st.caption("Streamlit Cloud 는 재시작하면 서버 파일이 지워지므로, 반영 후 이력 파일을 내려받아 보관하세요.")
+            for name in ["orders.csv", "eta_history.csv"]:
+                st.download_button(f"📥 {name}", (DATA_DIR / name).read_bytes(), file_name=f"{Path(name).stem}_{TODAY:%Y%m%d}.csv",
+                                   mime="text/csv", width="stretch", key=f"backup_{name}")
 
 st.title("📦 판넬 빌더 오더 납기 컨트롤 타워")
 st.caption(
